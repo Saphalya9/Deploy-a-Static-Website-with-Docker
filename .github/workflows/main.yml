@@ -1,0 +1,77 @@
+name: Deploy Partner Portal (test_dev) with Rollback
+
+on:
+  push:
+    branches:
+      - test_dev
+
+jobs:
+  deploy:
+    name: Deploy to EC2 with Rollback
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+    
+      - name: Start ssh-agent and add key
+        uses: webfactory/ssh-agent@v0.8.1
+        with:
+          ssh-private-key: ${{ secrets.PARTNERPORTAL_SSH_KEY }}
+
+      - name: SSH & Deploy with Rollback
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.PARTNERPORTAL_SERVER_HOST }}
+          username: ${{ secrets.PARTNER_PORTAL_SERVER_USER }}
+          
+          port: 22
+          script_stop: true
+          script: |
+            set -e
+            echo "🚀 Starting Deployment with Rollback Support..."
+            /home/ec2-user/partnerportal-test/partner_portal
+            echo "📌 Saving current stable commit SHA..."
+            STABLE_COMMIT=$(git rev-parse HEAD)
+            echo "Last stable commit: $STABLE_COMMIT"
+            echo "📌 Pulling latest code..."
+            git fetch --all || exit 1
+            git reset --hard origin/test_dev || exit 1
+            echo "📦 Building frontend..."
+            cd frontend
+            npm install || ROLLBACK=true
+            rm -rf dist || ROLLBACK=true
+            npm run build || ROLLBACK=true
+            cd ..
+            echo "🐍 Updating backend dependencies..."
+            source /home/ec2-user/miniconda3/bin/activate partnerportal
+            pip install -r requirements.txt || ROLLBACK=true
+            echo "🧪 Testing nginx..."
+            sudo nginx -t || ROLLBACK=true
+            echo "🚀 Restarting backend..."
+            sudo systemctl restart partner_portal_backend.service || ROLLBACK=true
+            echo "⏱ Waiting..."
+            sleep 5
+            echo "🩺 Health Check..."
+            sudo systemctl is-active --quiet partner_portal_backend.service || ROLLBACK=true
+            curl -f http://localhost/health >/dev/null 2>&1 || ROLLBACK=true
+            if [ "$ROLLBACK" = true ]; then
+              echo "⚠️ Deployment failed. Starting ROLLBACK!"
+              cd /home/ec2-user/partner_portal
+              git reset --hard $STABLE_COMMIT
+              cd frontend
+              npm install
+              rm -rf dist
+              npm run build
+              cd ..
+              source /home/ec2-user/miniconda3/bin/activate partnerportal
+              pip install -r requirements.txt
+              sudo systemctl restart nginx
+              sudo systemctl restart partner_portal_backend.service
+              sleep 3
+              sudo systemctl is-active --quiet partner_portal_backend.service || exit 1
+              echo "✅ Rollback successful."
+              exit 0
+            fi
+            echo "🎉 Deployment successful! No rollback needed."
